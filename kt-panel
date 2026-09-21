@@ -1,0 +1,784 @@
+/**
+ * 工单推送 — Cloudflare Workers + KV + 企业微信群机器人
+ *
+ * 需要在 Cloudflare 控制台配置：
+ *   KV 绑定   ORDER_KV        （变量名必须一致）
+ *   密钥      WEBHOOK_URL     企业微信机器人完整 Webhook 地址
+ *   密钥      ADMIN_PASSWORD  页面登录密码
+ */
+
+
+
+const LIMIT_BYTES = 3600; 
+
+/* ---------------- 工具函数 ---------------- */
+
+const json = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
+
+async function sha(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function authed(request, env) {
+  const given = request.headers.get('x-auth') || '';
+  return (await sha(given)) === (await sha(env.ADMIN_PASSWORD));
+}
+
+const page = (html) =>
+  new Response(html, {
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' },
+  });
+
+const loadList = async (env) => (await env.ORDER_KV.get('orders', 'json')) || [];
+const saveList = (env, list) => env.ORDER_KV.put('orders', JSON.stringify(list));
+
+function sorted(list) {
+  return [...list].sort((a, b) => {
+    const da = a.date || '9999';
+    const db = b.date || '9999';
+    if (da !== db) return da < db ? -1 : 1;
+    return (a.createdAt || 0) - (b.createdAt || 0);
+  });
+}
+
+const TEXT_FIELDS = ['name', 'vendor', 'engineer', 'lanes', 'address', 'note', 'date'];
+
+function clean(input, base) {
+  const o = { ...base };
+  for (const k of TEXT_FIELDS) {
+    if (k in input) o[k] = String(input[k] ?? '').trim().slice(0, 300);
+  }
+  if ('pending' in input) o.pending = !!input.pending;
+  if ('send' in input) o.send = !!input.send;
+  return o;
+}
+
+function validate(o) {
+  if (!o.name) return '项目名称必填';
+  if (o.date && !/^\d{4}-\d{2}-\d{2}$/.test(o.date)) return '日期格式应为 YYYY-MM-DD';
+  return null;
+}
+
+/* ---------------- 企业微信消息 ---------------- */
+
+const today = () => new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+const byteLen = (s) => new TextEncoder().encode(s).length;
+
+function block(o, i) {
+  const lines = [];
+  lines.push('**' + (i + 1) + '、' + o.name + '**' + (o.vendor ? '  <font color="info">' + o.vendor + '</font>' : ''));
+  const d = [];
+  if (o.pending) d.push('<font color="warning">待定</font>');
+  if (o.date) d.push(o.date);
+  if (d.length) lines.push('>日期：' + d.join(' '));
+  if (o.engineer) lines.push('>人员：' + o.engineer);
+  if (o.lanes) lines.push('>通道：' + o.lanes);
+  if (o.address) lines.push('>地址：' + o.address);
+  if (o.note) lines.push('>备注：' + o.note);
+  return lines.join('\n');
+}
+
+// 按字节数拆成多条消息，每页记录包含的工单，便于发送成功后标记
+function buildPages(items) {
+  const pages = [];
+  let cur = { items: [], blocks: [], bytes: 0 };
+  items.forEach((o, i) => {
+    const b = block(o, i);
+    const size = byteLen(b) + 2;
+    if (cur.items.length && cur.bytes + size > LIMIT_BYTES) {
+      pages.push(cur);
+      cur = { items: [], blocks: [], bytes: 0 };
+    }
+    cur.items.push(o);
+    cur.blocks.push(b);
+    cur.bytes += size;
+  });
+  if (cur.items.length) pages.push(cur);
+
+  return pages.map((p, idx) => ({
+    items: p.items,
+    text:
+      '## 📋 工单通知' + (pages.length > 1 ? '（' + (idx + 1) + '/' + pages.length + '）' : '') + '\n' +
+      '<font color="comment">' + today() + '　共 ' + items.length + ' 条</font>\n\n' +
+      p.blocks.join('\n\n'),
+  }));
+}
+
+async function pushToWecom(env, content) {
+  if (!env.WEBHOOK_URL) throw new Error('未配置环境变量 WEBHOOK_URL');
+  const res = await fetch(env.WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (data.errcode !== 0) throw new Error('企业微信返回 ' + data.errcode + '：' + (data.errmsg || res.status));
+}
+
+/* ---------------- 路由 ---------------- */
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (!path.startsWith('/api/')) {
+      if (path === '/') return page(PUBLIC_HTML);
+      if (path === '/admin' || path === '/admin/') return page(ADMIN_HTML);
+      return new Response('Not found', { status: 404 });
+    }
+
+    try {
+      if (!env.ORDER_KV) return json({ error: '未绑定 KV，变量名需为 ORDER_KV' }, 500);
+
+      // 公开只读接口：不需要密码
+      if (path === '/api/public' && method === 'GET') {
+        const list = (await loadList(env)).map(({ send, lastSentAt, createdAt, ...pub }) => pub);
+        return json({ orders: list });
+      }
+
+      if (!env.ADMIN_PASSWORD) return json({ error: '未配置环境变量 ADMIN_PASSWORD' }, 500);
+      if (!(await authed(request, env))) return json({ error: 'unauthorized' }, 401);
+
+      const idMatch = path.match(/^\/api\/orders\/([\w-]+)$/);
+
+      if (path === '/api/orders' && method === 'GET') {
+        return json({ orders: await loadList(env) });
+      }
+
+      if (path === '/api/orders' && method === 'POST') {
+        const body = await request.json();
+        const o = clean(body, { id: crypto.randomUUID(), send: true, pending: false, createdAt: Date.now() });
+        const err = validate(o);
+        if (err) return json({ error: err }, 400);
+        const list = await loadList(env);
+        list.push(o);
+        await saveList(env, list);
+        return json({ order: o });
+      }
+
+      if (idMatch && method === 'PUT') {
+        const list = await loadList(env);
+        const idx = list.findIndex((x) => x.id === idMatch[1]);
+        if (idx < 0) return json({ error: '工单不存在' }, 404);
+        const o = clean(await request.json(), list[idx]);
+        const err = validate(o);
+        if (err) return json({ error: err }, 400);
+        list[idx] = o;
+        await saveList(env, list);
+        return json({ order: o });
+      }
+
+      if (idMatch && method === 'DELETE') {
+        const list = await loadList(env);
+        await saveList(env, list.filter((x) => x.id !== idMatch[1]));
+        return json({ ok: true });
+      }
+
+      if (path === '/api/reorder' && method === 'POST') {
+        const { ids } = await request.json();
+        if (!Array.isArray(ids)) return json({ error: 'ids 必须是数组' }, 400);
+        const list = await loadList(env);
+        const rest = new Map(list.map((o) => [o.id, o]));
+        const next = [];
+        for (const id of ids) {
+          if (rest.has(id)) { next.push(rest.get(id)); rest.delete(id); }
+        }
+        for (const o of rest.values()) next.push(o); // 并发新增的工单排在最后
+        await saveList(env, next);
+        return json({ ok: true });
+      }
+
+      if (path === '/api/sort-by-date' && method === 'POST') {
+        await saveList(env, sorted(await loadList(env)));
+        return json({ ok: true });
+      }
+
+      if (path === '/api/preview' && method === 'POST') {
+        const items = (await loadList(env)).filter((o) => o.send);
+        return json({ count: items.length, messages: buildPages(items).map((p) => p.text) });
+      }
+
+      if (path === '/api/send' && method === 'POST') {
+        const items = (await loadList(env)).filter((o) => o.send);
+        if (!items.length) return json({ error: '没有勾选推送的工单' }, 400);
+        const pages = buildPages(items);
+        const sentIds = new Set();
+        let failure = null;
+        for (const p of pages) {
+          try {
+            await pushToWecom(env, p.text);
+            p.items.forEach((o) => sentIds.add(o.id));
+          } catch (e) {
+            failure = e;
+            break;
+          }
+        }
+        if (sentIds.size) {
+          const fresh = await loadList(env);
+          const ts = Date.now();
+          fresh.forEach((o) => { if (sentIds.has(o.id)) o.lastSentAt = ts; });
+          await saveList(env, fresh);
+        }
+        if (failure) return json({ error: failure.message + '（已成功发送 ' + sentIds.size + ' 条）', sent: sentIds.size }, 502);
+        return json({ sent: sentIds.size });
+      }
+
+      return json({ error: 'not found' }, 404);
+    } catch (e) {
+      return json({ error: e.message || String(e) }, 500);
+    }
+  },
+};
+
+/* ---------------- 前端页面 ---------------- */
+
+const CSS = `:root{--bg:#eceeeb;--paper:#fbfbf9;--ink:#17211d;--sub:#66726c;--line:#d5dbd6;--go:#0a7d55;--go-soft:#dcefe6;--hold:#9aa39e;--warn:#a85a00;--warn-soft:#f6e6cf;--danger:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#101412;--paper:#181d1a;--ink:#e6ebe8;--sub:#93a09a;--line:#2b332f;--go:#3cc38b;--go-soft:#15352a;--hold:#5c6862;--warn:#e0a24a;--warn-soft:#3a2b12;--danger:#f2857d}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--go);outline-offset:2px}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 16px}
+.bar{max-width:1100px;margin:0 auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1{font-size:19px;margin:0 auto 0 0;letter-spacing:.02em}
+.btn{border:1px solid var(--line);background:var(--paper);border-radius:6px;padding:7px 14px;min-height:38px}
+.btn:hover{border-color:var(--hold)}
+.btn.primary{background:var(--go);border-color:var(--go);color:#fff;font-weight:600}
+.btn.danger{color:var(--danger)}
+.btn.ghost{border-color:transparent;background:transparent;padding:6px 8px;color:var(--sub)}
+.btn:disabled{opacity:.5;cursor:default}
+.seg{max-width:1100px;margin:10px auto 0;display:flex;gap:6px}
+.seg button{border:1px solid var(--line);background:transparent;border-radius:999px;padding:4px 14px;color:var(--sub)}
+.seg button b{font-weight:600;margin-left:4px;color:var(--ink)}
+.seg button[aria-pressed=true]{background:var(--ink);border-color:var(--ink);color:var(--bg)}
+.seg button[aria-pressed=true] b{color:var(--bg)}
+main{max-width:1100px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+.card{background:var(--paper);border:1px solid var(--line);border-left:6px solid var(--go);border-radius:6px;padding:14px 14px 10px;display:flex;flex-direction:column;gap:8px}
+.card.off{border-left:6px dashed var(--hold);background:transparent}
+.card.off h3{color:var(--sub)}
+.top{display:flex;gap:10px;align-items:flex-start}
+h3{margin:0;font-size:16px;line-height:1.4;flex:1;word-break:break-all}
+.sw{display:flex;align-items:center;gap:6px;cursor:pointer;flex:none;user-select:none;font-size:13px;color:var(--sub)}
+.sw input{position:absolute;opacity:0;width:1px;height:1px}
+.sw i{width:34px;height:20px;border-radius:10px;background:var(--hold);position:relative;transition:background .15s}
+.sw i::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .15s}
+.sw input:checked+i{background:var(--go)}
+.sw input:checked+i::after{transform:translateX(14px)}
+.sw input:focus-visible+i{outline:2px solid var(--go);outline-offset:2px}
+.sw input:checked~span{color:var(--go);font-weight:600}
+.tags{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tag{background:var(--go-soft);color:var(--go);border-radius:4px;padding:1px 8px;font-size:13px;font-weight:600}
+.tag.warn{background:var(--warn-soft);color:var(--warn)}
+.date{font-size:13px;color:var(--sub);font-variant-numeric:tabular-nums}
+dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:14px}
+dt{color:var(--sub)}
+dd{margin:0;word-break:break-all}
+.foot{display:flex;align-items:center;gap:2px;margin-top:auto;padding-top:6px;border-top:1px solid var(--line)}
+.foot small{flex:1;color:var(--sub);font-size:12px}
+.empty{text-align:center;padding:60px 16px;color:var(--sub)}
+.empty p{margin:0 0 16px}
+.empty .btn{margin:0 4px}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);padding:0;width:min(560px,94vw);max-height:92vh}
+dialog::backdrop{background:rgba(10,15,12,.55)}
+.dh{padding:16px 18px 0;font-weight:700;font-size:17px}
+.db{padding:12px 18px;display:grid;gap:12px}
+.df{padding:12px 18px 16px;display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--line)}
+label.f{display:grid;gap:4px;font-size:13px;color:var(--sub)}
+label.f input,label.f select,label.f textarea{border:1px solid var(--line);background:var(--bg);border-radius:6px;padding:8px 10px;font-size:15px;color:var(--ink);width:100%}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.chk{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--ink)}
+.chk input{width:18px;height:18px;accent-color:var(--go)}
+.err{color:var(--danger);font-size:13px;min-height:1em;margin:0}
+pre{margin:0;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace}
+.hint{font-size:13px;color:var(--sub);margin:0}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:8px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:20;max-width:90vw}
+#toast.show{opacity:1}
+@media(max-width:480px){.two{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+a.btn{text-decoration:none;display:inline-flex;align-items:center}
+.card.pub{border-left-color:var(--go)}
+.card.pub.pending{border-left-color:var(--warn)}
+.seg{flex-wrap:wrap}
+.seg .sortbtn{margin-left:auto;border-radius:6px}
+.grip{position:relative;flex:none;width:16px;height:24px;margin:2px 0 0 -4px;border:0;padding:0;background:radial-gradient(circle,var(--sub) 1.5px,transparent 2px) 0 0/8px 8px;opacity:.65;cursor:grab;touch-action:none;border-radius:2px}
+.grip::before{content:"";position:absolute;inset:-8px -6px}
+.grip:hover,.grip:focus-visible{opacity:1}
+.card.dragging{position:relative;z-index:10;opacity:.96;box-shadow:0 12px 28px rgba(0,0,0,.28);cursor:grabbing;user-select:none;-webkit-user-select:none}
+body.dragging{user-select:none;-webkit-user-select:none;cursor:grabbing}`;
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>工单管理</title>
+<style>
+${CSS}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>工单管理</h1>
+    <a class="btn" href="/">公开页</a>
+    <button class="btn" id="btnAdd">新增工单</button>
+    <button class="btn primary" id="btnSend">发送到企业微信</button>
+  </div>
+  <div class="seg" id="seg"></div>
+</header>
+<main><div id="list" class="grid"></div></main>
+
+<dialog id="loginDlg">
+  <form id="loginForm">
+    <div class="dh">输入访问密码</div>
+    <div class="db">
+      <label class="f">密码<input id="pw" type="password" autocomplete="current-password" required></label>
+      <p class="err" id="loginMsg"></p>
+    </div>
+    <div class="df"><button class="btn primary" type="submit">进入</button></div>
+  </form>
+</dialog>
+
+<dialog id="formDlg">
+  <form id="form">
+    <div class="dh" id="formTitle">新增工单</div>
+    <div class="db">
+      <label class="f">项目名称<input id="f_name" required maxlength="100"></label>
+      <div class="two">
+        <label class="f">日期<input id="f_date" type="date"></label>
+        <label class="chk" style="align-self:end;min-height:38px"><input id="f_pending" type="checkbox">待定</label>
+      </div>
+      <div class="two">
+        <label class="f">类别<input id="f_vendor" list="vendors" maxlength="30"></label>
+        <label class="f">人员<input id="f_engineer" maxlength="30"></label>
+      </div>
+      <datalist id="vendors"><option value="科拓"><option value="红芯"><option value="速泊"><option value="安居"></datalist>
+      <label class="f">通道<input id="f_lanes" placeholder="例如 1进1出" maxlength="30"></label>
+      <label class="f">地址<input id="f_address" maxlength="200"></label>
+      <label class="f">备注<textarea id="f_note" rows="2" maxlength="200"></textarea></label>
+      <label class="chk"><input id="f_send" type="checkbox" checked>发送时推送到群里</label>
+    </div>
+    <div class="df">
+      <button class="btn" type="button" id="formCancel">取消</button>
+      <button class="btn primary" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pvDlg">
+  <div class="dh" id="pvHead">确认发送</div>
+  <div class="db">
+    <p class="hint">下面是消息原文，在企业微信里会显示为加粗和彩色文字。</p>
+    <div id="pvBody" style="display:grid;gap:10px;max-height:52vh;overflow:auto"></div>
+  </div>
+  <div class="df">
+    <button class="btn" id="pvCancel">取消</button>
+    <button class="btn primary" id="pvOk">确认发送</button>
+  </div>
+</dialog>
+
+<div id="toast" role="status"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let pw = '';
+try { pw = localStorage.getItem('wo_pw') || ''; } catch (e) {}
+let orders = [];
+let filter = 'all';
+let editing = null;
+
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in props || {}) {
+    if (k === 'class') e.className = props[k];
+    else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), props[k]);
+    else e.setAttribute(k, props[k]);
+  }
+  kids.flat(Infinity).forEach((c) => {
+    if (c === null || c === undefined || c === false) return;
+    e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  });
+  return e;
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+async function api(path, opts) {
+  opts = opts || {};
+  const res = await fetch(path, {
+    method: opts.method || 'GET',
+    headers: { 'content-type': 'application/json', 'x-auth': pw },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (res.status === 401) {
+    showLogin(pw ? '密码不正确' : '');
+    throw new Error('unauthorized');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+  return data;
+}
+
+function showLogin(msg) {
+  $('#loginMsg').textContent = msg || '';
+  if (!$('#loginDlg').open) $('#loginDlg').showModal();
+}
+$('#loginDlg').addEventListener('cancel', (e) => e.preventDefault());
+$('#loginForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  pw = $('#pw').value;
+  try { localStorage.setItem('wo_pw', pw); } catch (err) {}
+  $('#loginDlg').close();
+  load();
+});
+
+async function load() {
+  try {
+    orders = (await api('/api/orders')).orders;
+    render();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast(e.message);
+  }
+}
+
+function fmtTime(t) {
+  return new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+const canDrag = () => filter === 'all' && orders.length > 1;
+
+function grip() {
+  const g = el('button', { class: 'grip', type: 'button', title: '拖动排序（键盘可用方向键）', 'aria-label': '拖动排序' });
+  g.addEventListener('pointerdown', startDrag);
+  g.addEventListener('keydown', nudge);
+  return g;
+}
+
+const cardIds = () => [...document.querySelectorAll('#list .card')].map((c) => c.dataset.id);
+let drag = null;
+let saveChain = Promise.resolve();
+
+function startDrag(e) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const card = e.currentTarget.closest('.card');
+  const r = card.getBoundingClientRect();
+  drag = { card: card, gx: e.clientX - r.left, gy: e.clientY - r.top, x: e.clientX, y: e.clientY, before: cardIds(), timer: setInterval(tick, 16) };
+  card.classList.add('dragging');
+  document.body.classList.add('dragging');
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', endDrag);
+  window.addEventListener('pointercancel', endDrag);
+  place();
+}
+
+function onMove(e) {
+  drag.x = e.clientX;
+  drag.y = e.clientY;
+  place();
+}
+
+// 先在原始布局里判断鼠标下面是哪张卡片并调整顺序，再让被拖的卡片跟着鼠标走
+function place() {
+  const card = drag.card;
+  card.style.transform = 'none';
+  const t = document.elementsFromPoint(drag.x, drag.y).find((n) => n !== card && n.classList.contains('card'));
+  if (t && t.parentNode === card.parentNode) {
+    const tr = t.getBoundingClientRect();
+    if (drag.x < tr.left + tr.width / 2) t.before(card);
+    else t.after(card);
+  }
+  const r = card.getBoundingClientRect();
+  card.style.transform = 'translate(' + (drag.x - drag.gx - r.left) + 'px,' + (drag.y - drag.gy - r.top) + 'px)';
+}
+
+// 拖到屏幕上下边缘时自动滚动
+function tick() {
+  if (!drag) return;
+  const dy = drag.y < 150 ? -14 : drag.y > window.innerHeight - 80 ? 14 : 0;
+  if (dy) { window.scrollBy(0, dy); place(); }
+}
+
+function endDrag(e) {
+  if (!drag) return;
+  const card = drag.card;
+  const before = drag.before;
+  clearInterval(drag.timer);
+  drag = null;
+  window.removeEventListener('pointermove', onMove);
+  window.removeEventListener('pointerup', endDrag);
+  window.removeEventListener('pointercancel', endDrag);
+  card.style.transform = '';
+  card.classList.remove('dragging');
+  document.body.classList.remove('dragging');
+  if (e.type === 'pointercancel') { render(); return; }
+  commitOrder(before);
+}
+
+function nudge(e) {
+  const back = e.key === 'ArrowUp' || e.key === 'ArrowLeft';
+  const fwd = e.key === 'ArrowDown' || e.key === 'ArrowRight';
+  if (!back && !fwd) return;
+  e.preventDefault();
+  const g = e.currentTarget;
+  const card = g.closest('.card');
+  const before = cardIds();
+  if (back && card.previousElementSibling) card.previousElementSibling.before(card);
+  else if (fwd && card.nextElementSibling) card.nextElementSibling.after(card);
+  else return;
+  g.focus();
+  commitOrder(before);
+}
+
+function commitOrder(before) {
+  const now = cardIds();
+  if (now.join() === before.join()) return;
+  const map = new Map(orders.map((o) => [o.id, o]));
+  orders = now.map((id) => map.get(id));
+  saveChain = saveChain
+    .then(() => api('/api/reorder', { method: 'POST', body: { ids: now } }))
+    .then(() => toast('已保存顺序'))
+    .catch((err) => { if (err.message !== 'unauthorized') toast(err.message); load(); });
+}
+
+async function sortByDate() {
+  if (!confirm('按日期从早到晚重新排序？现在手动排好的顺序会被覆盖。')) return;
+  try { await api('/api/sort-by-date', { method: 'POST', body: {} }); toast('已按日期排序'); await load(); }
+  catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+}
+
+function card(o) {
+  const cb = el('input', { type: 'checkbox' });
+  cb.checked = !!o.send;
+  cb.addEventListener('change', async () => {
+    try {
+      await api('/api/orders/' + o.id, { method: 'PUT', body: { send: cb.checked } });
+      o.send = cb.checked;
+      render();
+    } catch (err) {
+      cb.checked = !cb.checked;
+      if (err.message !== 'unauthorized') toast(err.message);
+    }
+  });
+  const sw = el('label', { class: 'sw' }, cb, el('i'), el('span', {}, o.send ? '推送' : '不推送'));
+
+  const tags = el('div', { class: 'tags' },
+    o.vendor ? el('span', { class: 'tag' }, o.vendor) : null,
+    o.pending ? el('span', { class: 'tag warn' }, '待定') : null,
+    o.date ? el('span', { class: 'date' }, o.date) : null);
+
+  const rows = [['人员', o.engineer], ['通道', o.lanes], ['地址', o.address], ['备注', o.note]].filter((r) => r[1]);
+  const dl = el('dl', {}, rows.map((r) => [el('dt', {}, r[0]), el('dd', {}, r[1])]));
+
+  const foot = el('div', { class: 'foot' },
+    el('small', {}, o.lastSentAt ? '上次推送 ' + fmtTime(o.lastSentAt) : '还没推送过'),
+    el('button', { class: 'btn ghost', type: 'button', onclick: () => openForm(o) }, '编辑'),
+    el('button', { class: 'btn ghost danger', type: 'button', onclick: () => remove(o) }, '删除'));
+
+  return el('article', { class: 'card' + (o.send ? '' : ' off'), 'data-id': o.id }, el('div', { class: 'top' }, canDrag() ? grip() : null, el('h3', {}, o.name), sw), tags, dl, foot);
+}
+
+function render() {
+  const on = orders.filter((o) => o.send).length;
+  const seg = $('#seg');
+  seg.replaceChildren();
+  [['all', '全部', orders.length], ['on', '推送', on], ['off', '不推送', orders.length - on]].forEach((s) => {
+    const b = el('button', { type: 'button', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2]));
+    seg.append(b);
+  });
+  if (orders.length > 1) seg.append(el('button', { type: 'button', class: 'sortbtn', onclick: sortByDate }, '按日期排序'));
+
+  const box = $('#list');
+  box.replaceChildren();
+  if (!orders.length) {
+    box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' },
+      el('p', {}, '还没有工单'),
+      el('button', { class: 'btn primary', onclick: () => openForm(null) }, '新增工单')));
+    return;
+  }
+  const list = orders.filter((o) => filter === 'all' || (filter === 'on' ? o.send : !o.send));
+  if (!list.length) {
+    box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, '这个分类下没有工单')));
+    return;
+  }
+  list.forEach((o) => box.append(card(o)));
+}
+
+function openForm(o) {
+  editing = o ? o.id : null;
+  $('#formTitle').textContent = o ? '编辑工单' : '新增工单';
+  $('#f_name').value = o ? o.name : '';
+  $('#f_date').value = o ? o.date || '' : '';
+  $('#f_pending').checked = o ? !!o.pending : false;
+  $('#f_vendor').value = o ? o.vendor || '' : '';
+  $('#f_engineer').value = o ? o.engineer || '' : '';
+  $('#f_lanes').value = o ? o.lanes || '' : '';
+  $('#f_address').value = o ? o.address || '' : '';
+  $('#f_note').value = o ? o.note || '' : '';
+  $('#f_send').checked = o ? !!o.send : true;
+  $('#formDlg').showModal();
+}
+
+$('#btnAdd').addEventListener('click', () => openForm(null));
+$('#formCancel').addEventListener('click', () => $('#formDlg').close());
+$('#form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    name: $('#f_name').value,
+    date: $('#f_date').value,
+    pending: $('#f_pending').checked,
+    vendor: $('#f_vendor').value,
+    engineer: $('#f_engineer').value,
+    lanes: $('#f_lanes').value,
+    address: $('#f_address').value,
+    note: $('#f_note').value,
+    send: $('#f_send').checked,
+  };
+  try {
+    if (editing) await api('/api/orders/' + editing, { method: 'PUT', body });
+    else await api('/api/orders', { method: 'POST', body });
+    $('#formDlg').close();
+    toast('已保存');
+    await load();
+  } catch (err) {
+    if (err.message !== 'unauthorized') toast(err.message);
+  }
+});
+
+async function remove(o) {
+  if (!confirm('删除「' + o.name + '」？删除后无法恢复。')) return;
+  try { await api('/api/orders/' + o.id, { method: 'DELETE' }); toast('已删除'); await load(); }
+  catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
+}
+
+$('#btnSend').addEventListener('click', async () => {
+  try {
+    const d = await api('/api/preview', { method: 'POST', body: {} });
+    if (!d.count) { toast('没有勾选推送的工单'); return; }
+    $('#pvHead').textContent = '将发送 ' + d.count + ' 条工单，共 ' + d.messages.length + ' 条消息';
+    const box = $('#pvBody');
+    box.replaceChildren();
+    d.messages.forEach((t) => box.append(el('pre', {}, t)));
+    $('#pvDlg').showModal();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast(e.message);
+  }
+});
+$('#pvCancel').addEventListener('click', () => $('#pvDlg').close());
+$('#pvOk').addEventListener('click', async () => {
+  const b = $('#pvOk');
+  b.disabled = true;
+  try {
+    const d = await api('/api/send', { method: 'POST', body: {} });
+    $('#pvDlg').close();
+    toast('已发送 ' + d.sent + ' 条工单');
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast(e.message);
+  } finally {
+    b.disabled = false;
+    load();
+  }
+});
+
+load();
+</script>
+</body>
+</html>`;
+
+const PUBLIC_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>工单</title>
+<style>
+${CSS}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar"><h1>工单</h1></div>
+  <div class="seg" id="seg"></div>
+</header>
+<main><div id="list" class="grid"></div></main>
+<script>
+const $ = (s) => document.querySelector(s);
+let orders = [];
+let filter = 'all';
+
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in props || {}) {
+    if (k === 'class') e.className = props[k];
+    else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), props[k]);
+    else e.setAttribute(k, props[k]);
+  }
+  kids.flat(Infinity).forEach((c) => {
+    if (c === null || c === undefined || c === false) return;
+    e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  });
+  return e;
+}
+
+function card(o) {
+  const tags = el('div', { class: 'tags' },
+    o.vendor ? el('span', { class: 'tag' }, o.vendor) : null,
+    o.pending ? el('span', { class: 'tag warn' }, '待定') : null,
+    o.date ? el('span', { class: 'date' }, o.date) : null);
+  const rows = [['人员', o.engineer], ['通道', o.lanes], ['地址', o.address], ['备注', o.note]].filter((r) => r[1]);
+  const dl = el('dl', {}, rows.map((r) => [el('dt', {}, r[0]), el('dd', {}, r[1])]));
+  return el('article', { class: 'card pub' + (o.pending ? ' pending' : '') }, el('h3', {}, o.name), tags, dl);
+}
+
+function render() {
+  const pend = orders.filter((o) => o.pending).length;
+  const seg = $('#seg');
+  seg.replaceChildren();
+  [['all', '全部', orders.length], ['ok', '已确定', orders.length - pend], ['pending', '待定', pend]].forEach((s) => {
+    seg.append(el('button', { type: 'button', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2])));
+  });
+  const box = $('#list');
+  box.replaceChildren();
+  const list = orders.filter((o) => filter === 'all' || (filter === 'pending' ? o.pending : !o.pending));
+  if (!list.length) {
+    box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, orders.length ? '这个分类下没有工单' : '暂无工单')));
+    return;
+  }
+  list.forEach((o) => box.append(card(o)));
+}
+
+async function load() {
+  try {
+    const res = await fetch('/api/public');
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
+    orders = d.orders;
+    render();
+  } catch (e) {
+    const box = $('#list');
+    box.replaceChildren(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, '加载失败：' + e.message), el('button', { class: 'btn', onclick: load }, '重试')));
+  }
+}
+load();
+</script>
+</body>
+</html>`;

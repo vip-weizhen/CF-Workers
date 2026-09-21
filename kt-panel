@@ -7,8 +7,7 @@
  *   密钥      ADMIN_PASSWORD  页面登录密码
  */
 
-
-
+const KEEP_DAYS = 15; 
 const LIMIT_BYTES = 3600; 
 
 /* ---------------- 工具函数 ---------------- */
@@ -34,7 +33,9 @@ const page = (html) =>
     headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' },
   });
 
-const loadList = async (env) => (await env.ORDER_KV.get('orders', 'json')) || [];
+const expired = (o) => o.accepted && o.acceptedAt && Date.now() - o.acceptedAt > KEEP_DAYS * 864e5;
+// 已过期的已接单工单读取时就过滤掉，下次保存时会从 KV 里真正清除
+const loadList = async (env) => ((await env.ORDER_KV.get('orders', 'json')) || []).filter((o) => !expired(o));
 const saveList = (env, list) => env.ORDER_KV.put('orders', JSON.stringify(list));
 
 function sorted(list) {
@@ -55,6 +56,11 @@ function clean(input, base) {
   }
   if ('pending' in input) o.pending = !!input.pending;
   if ('send' in input) o.send = !!input.send;
+  if ('accepted' in input) {
+    o.accepted = !!input.accepted;
+    if (o.accepted && !base.accepted) o.acceptedAt = Date.now();
+    if (!o.accepted) delete o.acceptedAt;
+  }
   return o;
 }
 
@@ -66,7 +72,6 @@ function validate(o) {
 
 /* ---------------- 企业微信消息 ---------------- */
 
-const today = () => new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
 const byteLen = (s) => new TextEncoder().encode(s).length;
 
 function block(o, i) {
@@ -103,18 +108,17 @@ function buildPages(items) {
   return pages.map((p, idx) => ({
     items: p.items,
     text:
-      '## 📋 工单通知' + (pages.length > 1 ? '（' + (idx + 1) + '/' + pages.length + '）' : '') + '\n' +
-      '<font color="comment">' + today() + '　共 ' + items.length + ' 条</font>\n\n' +
+      '## 📋 工单通知' + (pages.length > 1 ? '（' + (idx + 1) + '/' + pages.length + '）' : '') + '\n\n' +
       p.blocks.join('\n\n'),
   }));
 }
 
-async function pushToWecom(env, content) {
+async function pushToWecom(env, payload) {
   if (!env.WEBHOOK_URL) throw new Error('未配置环境变量 WEBHOOK_URL');
   const res = await fetch(env.WEBHOOK_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
+    body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
   if (data.errcode !== 0) throw new Error('企业微信返回 ' + data.errcode + '：' + (data.errmsg || res.status));
@@ -140,7 +144,7 @@ export default {
       // 公开只读接口：不需要密码
       if (path === '/api/public' && method === 'GET') {
         const list = (await loadList(env)).map(({ send, lastSentAt, createdAt, ...pub }) => pub);
-        return json({ orders: list });
+        return json({ orders: list, keepDays: KEEP_DAYS });
       }
 
       if (!env.ADMIN_PASSWORD) return json({ error: '未配置环境变量 ADMIN_PASSWORD' }, 500);
@@ -149,7 +153,7 @@ export default {
       const idMatch = path.match(/^\/api\/orders\/([\w-]+)$/);
 
       if (path === '/api/orders' && method === 'GET') {
-        return json({ orders: await loadList(env) });
+        return json({ orders: await loadList(env), keepDays: KEEP_DAYS });
       }
 
       if (path === '/api/orders' && method === 'POST') {
@@ -201,19 +205,30 @@ export default {
       }
 
       if (path === '/api/preview' && method === 'POST') {
-        const items = (await loadList(env)).filter((o) => o.send);
+        const items = (await loadList(env)).filter((o) => o.send && !o.accepted);
         return json({ count: items.length, messages: buildPages(items).map((p) => p.text) });
       }
 
       if (path === '/api/send' && method === 'POST') {
-        const items = (await loadList(env)).filter((o) => o.send);
+        const items = (await loadList(env)).filter((o) => o.send && !o.accepted);
         if (!items.length) return json({ error: '没有勾选推送的工单' }, 400);
         const pages = buildPages(items);
+
+        // 企业微信的 markdown 消息不支持 @所有人，只有文本消息可以，所以先单独发一条文本提醒
+        const body = await request.json().catch(() => ({}));
+        if (body.mentionAll !== false) {
+          try {
+            await pushToWecom(env, { msgtype: 'text', text: { content: '📋 有 ' + items.length + ' 条工单，请查收', mentioned_list: ['@all'] } });
+          } catch (e) {
+            return json({ error: '@所有人 提醒发送失败：' + e.message + '（工单还没有发送）' }, 502);
+          }
+        }
+
         const sentIds = new Set();
         let failure = null;
         for (const p of pages) {
           try {
-            await pushToWecom(env, p.text);
+            await pushToWecom(env, { msgtype: 'markdown', markdown: { content: p.text } });
             p.items.forEach((o) => sentIds.add(o.id));
           } catch (e) {
             failure = e;
@@ -309,6 +324,12 @@ a.btn{text-decoration:none;display:inline-flex;align-items:center}
 .card.pub{border-left-color:var(--go)}
 .card.pub.pending{border-left-color:var(--warn)}
 .seg{flex-wrap:wrap}
+.seg .donechip{margin-left:6px}
+.tag.done{background:var(--line);color:var(--sub)}
+.card.done{border-left:6px solid var(--hold);background:transparent}
+.card.done h3{color:var(--sub)}
+.btn.ghost.ok{color:var(--go);font-weight:600}
+.hint.tight{margin-top:-6px}
 .seg .sortbtn{margin-left:auto;border-radius:6px}
 .grip{position:relative;flex:none;width:16px;height:24px;margin:2px 0 0 -4px;border:0;padding:0;background:radial-gradient(circle,var(--sub) 1.5px,transparent 2px) 0 0/8px 8px;opacity:.65;cursor:grab;touch-action:none;border-radius:2px}
 .grip::before{content:"";position:absolute;inset:-8px -6px}
@@ -360,10 +381,10 @@ ${CSS}
         <label class="chk" style="align-self:end;min-height:38px"><input id="f_pending" type="checkbox">待定</label>
       </div>
       <div class="two">
-        <label class="f">类别<input id="f_vendor" list="vendors" maxlength="30"></label>
+        <label class="f">厂商<input id="f_vendor" list="vendors" maxlength="30"></label>
         <label class="f">人员<input id="f_engineer" maxlength="30"></label>
       </div>
-      <datalist id="vendors"><option value="科拓"><option value="红芯"><option value="速泊"><option value="安居"></datalist>
+      <datalist id="vendors"><option value="科拓"><option value="红芯"><option value="速泊"><option value="安居"><option value="其他"></datalist>
       <label class="f">通道<input id="f_lanes" placeholder="例如 1进1出" maxlength="30"></label>
       <label class="f">地址<input id="f_address" maxlength="200"></label>
       <label class="f">备注<textarea id="f_note" rows="2" maxlength="200"></textarea></label>
@@ -380,6 +401,8 @@ ${CSS}
   <div class="dh" id="pvHead">确认发送</div>
   <div class="db">
     <p class="hint">下面是消息原文，在企业微信里会显示为加粗和彩色文字。</p>
+    <label class="chk"><input id="pvAt" type="checkbox" checked>@所有人</label>
+    <p class="hint tight">企业微信的 markdown 消息不支持 @所有人，勾选后会先单独发一条文字提醒。</p>
     <div id="pvBody" style="display:grid;gap:10px;max-height:52vh;overflow:auto"></div>
   </div>
   <div class="df">
@@ -397,6 +420,7 @@ try { pw = localStorage.getItem('wo_pw') || ''; } catch (e) {}
 let orders = [];
 let filter = 'all';
 let editing = null;
+let keepDays = 7;
 
 function el(tag, props, ...kids) {
   const e = document.createElement(tag);
@@ -452,7 +476,9 @@ $('#loginForm').addEventListener('submit', (e) => {
 
 async function load() {
   try {
-    orders = (await api('/api/orders')).orders;
+    const d = await api('/api/orders');
+    orders = d.orders;
+    keepDays = d.keepDays || 7;
     render();
   } catch (e) {
     if (e.message !== 'unauthorized') toast(e.message);
@@ -463,7 +489,7 @@ function fmtTime(t) {
   return new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-const canDrag = () => filter === 'all' && orders.length > 1;
+const canDrag = () => filter === 'all' && orders.filter((o) => !o.accepted).length > 1;
 
 function grip() {
   const g = el('button', { class: 'grip', type: 'button', title: '拖动排序（键盘可用方向键）', 'aria-label': '拖动排序' });
@@ -552,7 +578,8 @@ function commitOrder(before) {
   const now = cardIds();
   if (now.join() === before.join()) return;
   const map = new Map(orders.map((o) => [o.id, o]));
-  orders = now.map((id) => map.get(id));
+  const inNow = new Set(now);
+  orders = now.map((id) => map.get(id)).concat(orders.filter((o) => !inNow.has(o.id)));
   saveChain = saveChain
     .then(() => api('/api/reorder', { method: 'POST', body: { ids: now } }))
     .then(() => toast('已保存顺序'))
@@ -565,7 +592,34 @@ async function sortByDate() {
   catch (e) { if (e.message !== 'unauthorized') toast(e.message); }
 }
 
+async function setAccepted(o, v) {
+  try {
+    await api('/api/orders/' + o.id, { method: 'PUT', body: { accepted: v } });
+    toast(v ? '已移到「已接单」，保留 ' + keepDays + ' 天' : '已撤销接单');
+    await load();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast(e.message);
+  }
+}
+
+function doneCard(o) {
+  const t = o.acceptedAt || Date.now();
+  const days = Math.max(1, Math.ceil((t + keepDays * 864e5 - Date.now()) / 864e5));
+  const tags = el('div', { class: 'tags' },
+    el('span', { class: 'tag done' }, '已接单'),
+    o.vendor ? el('span', { class: 'tag' }, o.vendor) : null,
+    o.date ? el('span', { class: 'date' }, o.date) : null);
+  const rows = [['人员', o.engineer], ['通道', o.lanes], ['地址', o.address], ['备注', o.note]].filter((r) => r[1]);
+  const dl = el('dl', {}, rows.map((r) => [el('dt', {}, r[0]), el('dd', {}, r[1])]));
+  const foot = el('div', { class: 'foot' },
+    el('small', {}, fmtTime(t) + ' 接单，还剩 ' + days + ' 天自动删除'),
+    el('button', { class: 'btn ghost', type: 'button', onclick: () => setAccepted(o, false) }, '撤销'),
+    el('button', { class: 'btn ghost danger', type: 'button', onclick: () => remove(o) }, '删除'));
+  return el('article', { class: 'card done', 'data-id': o.id }, el('div', { class: 'top' }, el('h3', {}, o.name)), tags, dl, foot);
+}
+
 function card(o) {
+  if (o.accepted) return doneCard(o);
   const cb = el('input', { type: 'checkbox' });
   cb.checked = !!o.send;
   cb.addEventListener('change', async () => {
@@ -590,6 +644,7 @@ function card(o) {
 
   const foot = el('div', { class: 'foot' },
     el('small', {}, o.lastSentAt ? '上次推送 ' + fmtTime(o.lastSentAt) : '还没推送过'),
+    el('button', { class: 'btn ghost ok', type: 'button', onclick: () => setAccepted(o, true) }, '已接单'),
     el('button', { class: 'btn ghost', type: 'button', onclick: () => openForm(o) }, '编辑'),
     el('button', { class: 'btn ghost danger', type: 'button', onclick: () => remove(o) }, '删除'));
 
@@ -597,14 +652,15 @@ function card(o) {
 }
 
 function render() {
-  const on = orders.filter((o) => o.send).length;
+  const open = orders.filter((o) => !o.accepted);
+  const done = orders.filter((o) => o.accepted).sort((a, b) => (b.acceptedAt || 0) - (a.acceptedAt || 0));
+  const on = open.filter((o) => o.send).length;
   const seg = $('#seg');
   seg.replaceChildren();
-  [['all', '全部', orders.length], ['on', '推送', on], ['off', '不推送', orders.length - on]].forEach((s) => {
-    const b = el('button', { type: 'button', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2]));
-    seg.append(b);
+  [['all', '未接单', open.length], ['on', '推送', on], ['off', '不推送', open.length - on], ['done', '已接单', done.length]].forEach((s) => {
+    seg.append(el('button', { type: 'button', class: s[0] === 'done' ? 'donechip' : '', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2])));
   });
-  if (orders.length > 1) seg.append(el('button', { type: 'button', class: 'sortbtn', onclick: sortByDate }, '按日期排序'));
+  if (open.length > 1) seg.append(el('button', { type: 'button', class: 'sortbtn', onclick: sortByDate }, '按日期排序'));
 
   const box = $('#list');
   box.replaceChildren();
@@ -614,9 +670,9 @@ function render() {
       el('button', { class: 'btn primary', onclick: () => openForm(null) }, '新增工单')));
     return;
   }
-  const list = orders.filter((o) => filter === 'all' || (filter === 'on' ? o.send : !o.send));
+  const list = filter === 'done' ? done : open.filter((o) => filter === 'all' || (filter === 'on' ? o.send : !o.send));
   if (!list.length) {
-    box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, '这个分类下没有工单')));
+    box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, filter === 'done' ? '还没有已接单的工单' : '这个分类下没有工单')));
     return;
   }
   list.forEach((o) => box.append(card(o)));
@@ -677,6 +733,7 @@ $('#btnSend').addEventListener('click', async () => {
     const box = $('#pvBody');
     box.replaceChildren();
     d.messages.forEach((t) => box.append(el('pre', {}, t)));
+    $('#pvAt').checked = true;
     $('#pvDlg').showModal();
   } catch (e) {
     if (e.message !== 'unauthorized') toast(e.message);
@@ -687,7 +744,7 @@ $('#pvOk').addEventListener('click', async () => {
   const b = $('#pvOk');
   b.disabled = true;
   try {
-    const d = await api('/api/send', { method: 'POST', body: {} });
+    const d = await api('/api/send', { method: 'POST', body: { mentionAll: $('#pvAt').checked } });
     $('#pvDlg').close();
     toast('已发送 ' + d.sent + ' 条工单');
   } catch (e) {
@@ -741,24 +798,27 @@ function el(tag, props, ...kids) {
 
 function card(o) {
   const tags = el('div', { class: 'tags' },
+    o.accepted ? el('span', { class: 'tag done' }, '已接单') : null,
     o.vendor ? el('span', { class: 'tag' }, o.vendor) : null,
     o.pending ? el('span', { class: 'tag warn' }, '待定') : null,
     o.date ? el('span', { class: 'date' }, o.date) : null);
   const rows = [['人员', o.engineer], ['通道', o.lanes], ['地址', o.address], ['备注', o.note]].filter((r) => r[1]);
   const dl = el('dl', {}, rows.map((r) => [el('dt', {}, r[0]), el('dd', {}, r[1])]));
-  return el('article', { class: 'card pub' + (o.pending ? ' pending' : '') }, el('h3', {}, o.name), tags, dl);
+  return el('article', { class: 'card pub' + (o.accepted ? ' done' : o.pending ? ' pending' : '') }, el('h3', {}, o.name), tags, dl);
 }
 
 function render() {
-  const pend = orders.filter((o) => o.pending).length;
+  const open = orders.filter((o) => !o.accepted);
+  const done = orders.filter((o) => o.accepted).sort((a, b) => (b.acceptedAt || 0) - (a.acceptedAt || 0));
+  const pend = open.filter((o) => o.pending).length;
   const seg = $('#seg');
   seg.replaceChildren();
-  [['all', '全部', orders.length], ['ok', '已确定', orders.length - pend], ['pending', '待定', pend]].forEach((s) => {
-    seg.append(el('button', { type: 'button', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2])));
+  [['all', '未接单', open.length], ['ok', '已确定', open.length - pend], ['pending', '待定', pend], ['done', '已接单', done.length]].forEach((s) => {
+    seg.append(el('button', { type: 'button', class: s[0] === 'done' ? 'donechip' : '', 'aria-pressed': String(filter === s[0]), onclick: () => { filter = s[0]; render(); } }, s[1], el('b', {}, s[2])));
   });
   const box = $('#list');
   box.replaceChildren();
-  const list = orders.filter((o) => filter === 'all' || (filter === 'pending' ? o.pending : !o.pending));
+  const list = filter === 'done' ? done : open.filter((o) => filter === 'all' || (filter === 'pending' ? o.pending : !o.pending));
   if (!list.length) {
     box.append(el('div', { class: 'empty', style: 'grid-column:1/-1' }, el('p', {}, orders.length ? '这个分类下没有工单' : '暂无工单')));
     return;
